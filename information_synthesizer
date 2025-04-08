@@ -1,0 +1,822 @@
+"""
+Information Synthesizer (IS) - The Curator
+----------------------------------------
+Processes raw inputs into structured, emotionally-contextualized knowledge for LTM.
+Key responsibilities:
+- Acting as the LTM ingestion pipeline
+- Cleaning and pre-processing text
+- Tagging content with emotional context via GoEmotions classifier
+- Using LLM to extract entities, relationships, and summaries
+- Generating embeddings for vector storage
+- Creating graph structure for relationship modeling
+- Managing database writes to Vector DB and Graph DB
+- Detecting contradictions with existing knowledge
+"""
+
+import json
+import logging
+import uuid
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
+from enum import Enum
+import re
+import requests
+
+from google.cloud import aiplatform
+from google.cloud.aiplatform.preview.generative_models import GenerativeModel
+
+# Configure logging
+logger = logging.getLogger("aetherius.information_synthesizer")
+
+class ContentType(Enum):
+    """Defines the types of content the Synthesizer can process."""
+    SEARCH_RESULT = "search_result"
+    TWEET = "tweet"
+    LLM_THOUGHT = "llm_thought"
+    IMAGINATION = "imagination"
+    INTERACTION = "interaction"
+    DECISION = "decision"
+
+class EmotionClassifier:
+    """
+    Wrapper for the GoEmotions classifier.
+    This is a simplified implementation - in production, this would
+    call a deployed model endpoint on Vertex AI.
+    """
+    
+    def __init__(self, config: Dict):
+        """Initialize the emotion classifier."""
+        self.config = config
+        self.endpoint_name = config.get("emotion_endpoint_name")
+        self.project_id = config.get("project_id")
+        self.location = config.get("location", "us-central1")
+        self.confidence_threshold = config.get("confidence_threshold", 0.5)
+        
+        # Main emotions from GoEmotions taxonomy
+        self.emotions = [
+            "admiration", "amusement", "anger", "annoyance", "approval", "caring", 
+            "confusion", "curiosity", "desire", "disappointment", "disapproval", 
+            "disgust", "embarrassment", "excitement", "fear", "gratitude", "grief", 
+            "joy", "love", "nervousness", "optimism", "pride", "realization", "relief", 
+            "remorse", "sadness", "surprise", "neutral"
+        ]
+        
+        logger.info("Emotion classifier initialized")
+    
+    def classify(self, text: str) -> List[Dict]:
+        """
+        Classify text using the GoEmotions classifier.
+        
+        Args:
+            text: Text to classify
+            
+        Returns:
+            List[Dict]: Emotions with confidence scores
+        """
+        # In production, this would call the deployed endpoint
+        # For now, we'll simulate results based on simple keyword matching
+        return self._simulate_emotion_classification(text)
+    
+    def _simulate_emotion_classification(self, text: str) -> List[Dict]:
+        """
+        Simulate emotion classification for testing purposes.
+        
+        Args:
+            text: Text to classify
+            
+        Returns:
+            List[Dict]: Simulated emotions with confidence scores
+        """
+        text = text.lower()
+        
+        # Simple keyword-based simulation
+        emotion_scores = []
+        
+        # Default to neutral with medium confidence
+        emotion_scores.append({"emotion": "neutral", "score": 0.6})
+        
+        # Check for emotion keywords
+        emotion_keywords = {
+            "admiration": ["amazing", "impressive", "excellent", "brilliant", "outstanding"],
+            "amusement": ["funny", "hilarious", "amusing", "laughing", "humor"],
+            "anger": ["angry", "furious", "outraged", "mad", "infuriated"],
+            "annoyance": ["annoying", "irritating", "bothered", "frustrated", "annoyed"],
+            "approval": ["agree", "approve", "endorse", "good idea", "right"],
+            "curiosity": ["curious", "interested", "wonder", "intriguing", "fascinating"],
+            "disappointment": ["disappointed", "letdown", "unfortunate", "shame", "too bad"],
+            "excitement": ["excited", "thrilled", "enthusiastic", "can't wait", "wow"],
+            "joy": ["happy", "joy", "delighted", "pleased", "glad"],
+            "sadness": ["sad", "unhappy", "depressed", "heartbroken", "grief"],
+            "surprise": ["surprised", "shocking", "unexpected", "astonished", "amazed"]
+        }
+        
+        # Check each emotion's keywords
+        for emotion, keywords in emotion_keywords.items():
+            for keyword in keywords:
+                if keyword in text:
+                    # Calculate a simulated score based on position and count
+                    position_factor = 1.0 - (text.find(keyword) / len(text)) * 0.3
+                    count_factor = text.count(keyword) * 0.1
+                    score = min(0.95, 0.7 + position_factor + count_factor)
+                    
+                    emotion_scores.append({"emotion": emotion, "score": score})
+                    break  # Only count each emotion once
+        
+        # Sort by score and filter by threshold
+        emotion_scores = sorted(emotion_scores, key=lambda x: x["score"], reverse=True)
+        filtered_scores = [e for e in emotion_scores if e["score"] >= self.confidence_threshold]
+        
+        # If all emotions were filtered out, keep neutral
+        if not filtered_scores:
+            return [{"emotion": "neutral", "score": 0.6}]
+            
+        return filtered_scores
+
+class InformationSynthesizer:
+    """
+    Processes raw inputs into structured knowledge for Long-Term Memory.
+    Acts as the LTM ingestion pipeline, adding emotional context,
+    structuring data, and preparing it for storage in the Vector and Graph DBs.
+    """
+    
+    def __init__(self, config: Dict):
+        """Initialize the Information Synthesizer."""
+        self.config = config
+        self.project_id = config.get("project_id")
+        self.location = config.get("location", "us-central1")
+        self.model_id = config.get("model_id", "gemini-1.5-flash")  # Use Flash for processing tasks
+        
+        # Initialize emotion classifier
+        emotion_config = config.get("emotion_classifier", {})
+        self.emotion_classifier = EmotionClassifier(emotion_config)
+        
+        # Initialize Vertex AI
+        aiplatform.init(project=self.project_id, location=self.location)
+        
+        logger.info("Information Synthesizer initialized")
+    
+    def process_content(self, content: Dict, content_type: ContentType) -> Dict:
+        """
+        Process content through the synthesis pipeline.
+        
+        Args:
+            content: Raw content to process
+            content_type: Type of content
+            
+        Returns:
+            Dict: Processed content ready for LTM storage
+        """
+        logger.info(f"Processing content of type: {content_type.value}")
+        
+        try:
+            # 1. Input triage and pre-processing
+            chunks = self._preprocess_content(content, content_type)
+            
+            # 2. Emotion tagging
+            for chunk in chunks:
+                emotions = self._tag_emotions(chunk["text"])
+                chunk["emotions"] = emotions
+                logger.info(f"Tagged emotions: {[e['emotion'] for e in emotions]}")
+            
+            # 3. Summarization and extraction
+            processed_data = self._extract_and_summarize(chunks, content_type)
+            
+            # 4. Generate embeddings
+            processed_data = self._generate_embeddings(processed_data)
+            
+            # 5. Generate graph structure
+            graph_data = self._generate_graph_structure(processed_data, content_type)
+            
+            # 6. Combine everything for storage
+            storage_ready_data = {
+                "content_id": str(uuid.uuid4()),
+                "content_type": content_type.value,
+                "processed_timestamp": datetime.now().isoformat(),
+                "raw_content": content,
+                "processed_chunks": chunks,
+                "vector_data": processed_data,
+                "graph_data": graph_data,
+                "metadata": {
+                    "source": self._determine_source(content, content_type),
+                    "creation_timestamp": self._extract_timestamp(content, content_type),
+                    "emotional_context": self._aggregate_emotions(chunks)
+                }
+            }
+            
+            logger.info(f"Successfully processed content: {storage_ready_data['content_id']}")
+            return storage_ready_data
+            
+        except Exception as e:
+            logger.error(f"Error processing content: {str(e)}")
+            raise
+    
+    def _preprocess_content(self, content: Dict, content_type: ContentType) -> List[Dict]:
+        """
+        Preprocess content by cleaning and splitting into appropriate chunks.
+        
+        Args:
+            content: Raw content
+            content_type: Type of content
+            
+        Returns:
+            List[Dict]: List of preprocessed content chunks
+        """
+        chunks = []
+        
+        # Extract and clean text based on content type
+        if content_type == ContentType.SEARCH_RESULT:
+            # Process each search result as a separate chunk
+            for result in content.get("results", []):
+                chunks.append({
+                    "chunk_id": str(uuid.uuid4()),
+                    "text": self._clean_text(result.get("snippet", "")),
+                    "title": result.get("title", ""),
+                    "source_url": result.get("link", ""),
+                    "display_url": result.get("display_link", "")
+                })
+                
+        elif content_type == ContentType.TWEET:
+            # Process each tweet
+            for tweet in content.get("tweets", []):
+                chunks.append({
+                    "chunk_id": str(uuid.uuid4()),
+                    "text": self._clean_text(tweet.get("text", "")),
+                    "tweet_id": tweet.get("id", ""),
+                    "author": tweet.get("author", {}).get("username", ""),
+                    "metrics": tweet.get("public_metrics", {})
+                })
+                
+        elif content_type == ContentType.LLM_THOUGHT:
+            # Split LLM thoughts into manageable chunks
+            text = content.get("text", "")
+            chunk_size = 500  # Characters per chunk
+            
+            # Simple splitting by paragraphs or sentences
+            paragraphs = re.split(r'\n\s*\n', text)
+            current_chunk = ""
+            
+            for para in paragraphs:
+                if len(current_chunk) + len(para) <= chunk_size:
+                    current_chunk += para + "\n\n"
+                else:
+                    if current_chunk:
+                        chunks.append({
+                            "chunk_id": str(uuid.uuid4()),
+                            "text": self._clean_text(current_chunk),
+                            "thought_type": content.get("thought_type", "general")
+                        })
+                    current_chunk = para + "\n\n"
+            
+            # Add the last chunk
+            if current_chunk:
+                chunks.append({
+                    "chunk_id": str(uuid.uuid4()),
+                    "text": self._clean_text(current_chunk),
+                    "thought_type": content.get("thought_type", "general")
+                })
+                
+        elif content_type == ContentType.IMAGINATION:
+            # Process imagination outputs
+            text = content.get("text", "")
+            chunk_size = 800  # Larger chunks for imagination
+            
+            # Split by natural breaks in the imaginative narrative
+            sections = re.split(r'\n\s*\n', text)
+            current_chunk = ""
+            
+            for section in sections:
+                if len(current_chunk) + len(section) <= chunk_size:
+                    current_chunk += section + "\n\n"
+                else:
+                    if current_chunk:
+                        chunks.append({
+                            "chunk_id": str(uuid.uuid4()),
+                            "text": self._clean_text(current_chunk),
+                            "scenario": content.get("scenario", ""),
+                            "imagination_type": content.get("imagination_type", "general")
+                        })
+                    current_chunk = section + "\n\n"
+            
+            # Add the last chunk
+            if current_chunk:
+                chunks.append({
+                    "chunk_id": str(uuid.uuid4()),
+                    "text": self._clean_text(current_chunk),
+                    "scenario": content.get("scenario", ""),
+                    "imagination_type": content.get("imagination_type", "general")
+                })
+            
+        elif content_type == ContentType.INTERACTION:
+            # Process interaction data (e.g., conversation with external systems)
+            chunks.append({
+                "chunk_id": str(uuid.uuid4()),
+                "text": self._clean_text(content.get("content", "")),
+                "participant": content.get("participant", ""),
+                "interaction_type": content.get("interaction_type", "conversation")
+            })
+            
+        elif content_type == ContentType.DECISION:
+            # Process decision records
+            chunks.append({
+                "chunk_id": str(uuid.uuid4()),
+                "text": self._clean_text(content.get("description", "")),
+                "decision": content.get("decision", ""),
+                "rationale": self._clean_text(content.get("rationale", "")),
+                "alternatives": content.get("alternatives", []),
+                "outcome": content.get("outcome", "pending")
+            })
+        
+        if not chunks:
+            # Create a fallback chunk if no specific processing matched
+            chunks.append({
+                "chunk_id": str(uuid.uuid4()),
+                "text": self._clean_text(str(content)),
+                "content_type": content_type.value
+            })
+            
+        logger.info(f"Preprocessed content into {len(chunks)} chunks")
+        return chunks
+    
+    def _clean_text(self, text: str) -> str:
+        """
+        Clean text by removing extra whitespace, fixing formatting, etc.
+        
+        Args:
+            text: Raw text to clean
+            
+        Returns:
+            str: Cleaned text
+        """
+        if not text:
+            return ""
+            
+        # Convert to string if not already
+        text = str(text)
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Fix common formatting issues
+        text = text.replace('\n\n\n', '\n\n')
+        
+        # Strip leading/trailing whitespace
+        text = text.strip()
+        
+        return text
+    
+    def _tag_emotions(self, text: str) -> List[Dict]:
+        """
+        Tag text with emotional context.
+        
+        Args:
+            text: Text to tag
+            
+        Returns:
+            List[Dict]: Emotions with confidence scores
+        """
+        if not text:
+            return [{"emotion": "neutral", "score": 1.0}]
+            
+        try:
+            # Call the emotion classifier
+            emotions = self.emotion_classifier.classify(text)
+            
+            # Log the results
+            emotion_summary = ", ".join([f"{e['emotion']} ({e['score']:.2f})" for e in emotions[:3]])
+            logger.info(f"Emotion classification: {emotion_summary}")
+            
+            return emotions
+            
+        except Exception as e:
+            logger.error(f"Error during emotion tagging: {str(e)}")
+            # Default to neutral in case of error
+            return [{"emotion": "neutral", "score": 1.0}]
+    
+    def _extract_and_summarize(self, chunks: List[Dict], content_type: ContentType) -> Dict:
+        """
+        Extract entities, relationships, and create summaries using LLM.
+        
+        Args:
+            chunks: Preprocessed content chunks
+            content_type: Type of content
+            
+        Returns:
+            Dict: Extracted data and summaries
+        """
+        try:
+            # In production, this would call the LLM to perform extraction
+            # For now, we'll simulate extraction based on content type
+            
+            # Combine chunk texts for full context
+            full_text = "\n\n".join([chunk.get("text", "") for chunk in chunks])
+            
+            # Extract entities based on content type
+            entities = self._simulate_entity_extraction(full_text, content_type)
+            
+            # Extract relationships between entities
+            relationships = self._simulate_relationship_extraction(entities, full_text)
+            
+            # Generate summary
+            summary = self._generate_summary(full_text, content_type)
+            
+            # Return processed data
+            return {
+                "entities": entities,
+                "relationships": relationships,
+                "summary": summary,
+                "key_phrases": self._extract_key_phrases(full_text)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error during extraction and summarization: {str(e)}")
+            # Return minimal structure in case of error
+            return {
+                "entities": [],
+                "relationships": [],
+                "summary": "Error processing content",
+                "key_phrases": []
+            }
+    
+    def _simulate_entity_extraction(self, text: str, content_type: ContentType) -> List[Dict]:
+        """
+        Simulate entity extraction from text.
+        
+        Args:
+            text: Text to extract entities from
+            content_type: Type of content
+            
+        Returns:
+            List[Dict]: Extracted entities
+        """
+        entities = []
+        
+        # Very simplified entity extraction simulation
+        # In production, this would use the LLM
+        
+        # Look for people (simple regex for Name Surname patterns)
+        person_matches = re.findall(r'([A-Z][a-z]+ [A-Z][a-z]+)', text)
+        for match in person_matches:
+            if len(match.split()) == 2:  # Basic check for first/last name
+                entities.append({
+                    "entity_id": str(uuid.uuid4()),
+                    "type": "person",
+                    "name": match,
+                    "mentions": [match],
+                    "confidence": 0.8
+                })
+        
+        # Look for organizations (capitalized words)
+        org_matches = re.findall(r'([A-Z][a-zA-Z]+ (?:Inc|Corp|LLC|Company|Organization|Foundation))', text)
+        for match in org_matches:
+            entities.append({
+                "entity_id": str(uuid.uuid4()),
+                "type": "organization",
+                "name": match,
+                "mentions": [match],
+                "confidence": 0.7
+            })
+        
+        # Look for concepts (AI, ethics, etc.)
+        concept_keywords = ["artificial intelligence", "AI", "ethics", "neural network",
+                          "machine learning", "deep learning", "algorithm", "data privacy"]
+        
+        for keyword in concept_keywords:
+            if keyword.lower() in text.lower():
+                # Find actual mention (preserve case)
+                pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+                mentions = pattern.findall(text)
+                
+                if mentions:
+                    entities.append({
+                        "entity_id": str(uuid.uuid4()),
+                        "type": "concept",
+                        "name": keyword,
+                        "mentions": mentions,
+                        "confidence": 0.85
+                    })
+        
+        logger.info(f"Extracted {len(entities)} entities")
+        return entities
+    
+    def _simulate_relationship_extraction(self, entities: List[Dict], text: str) -> List[Dict]:
+        """
+        Simulate relationship extraction between entities.
+        
+        Args:
+            entities: Extracted entities
+            text: Original text
+            
+        Returns:
+            List[Dict]: Extracted relationships
+        """
+        relationships = []
+        
+        # In production, this would use the LLM to identify complex relationships
+        # For now, just simulate basic relationships
+        
+        # Create entity map for quick lookup
+        entity_map = {entity["entity_id"]: entity for entity in entities}
+        
+        # Check for co-occurrence relationships
+        for i, entity1 in enumerate(entities):
+            for j, entity2 in enumerate(entities):
+                if i < j:  # Avoid duplicates and self-relationships
+                    # Check if both entities are mentioned within 100 chars of each other
+                    mention1 = entity1["mentions"][0]
+                    mention2 = entity2["mentions"][0]
+                    
+                    pos1 = text.find(mention1)
+                    pos2 = text.find(mention2)
+                    
+                    if pos1 >= 0 and pos2 >= 0 and abs(pos1 - pos2) < 100:
+                        rel_type = "related_to"
+                        
+                        # Infer more specific relationships based on entity types
+                        if entity1["type"] == "person" and entity2["type"] == "organization":
+                            rel_type = "affiliated_with"
+                        elif entity1["type"] == "person" and entity2["type"] == "concept":
+                            rel_type = "expert_in"
+                        elif entity1["type"] == "concept" and entity2["type"] == "concept":
+                            rel_type = "related_concept"
+                        
+                        relationships.append({
+                            "relationship_id": str(uuid.uuid4()),
+                            "type": rel_type,
+                            "source_id": entity1["entity_id"],
+                            "target_id": entity2["entity_id"],
+                            "source_type": entity1["type"],
+                            "target_type": entity2["type"],
+                            "confidence": 0.6,
+                            "extracted_text": text[min(pos1, pos2):max(pos1, pos2) + max(len(mention1), len(mention2))]
+                        })
+        
+        logger.info(f"Extracted {len(relationships)} relationships")
+        return relationships
+    
+    def _generate_summary(self, text: str, content_type: ContentType) -> str:
+        """
+        Generate a summary of the content.
+        
+        Args:
+            text: Text to summarize
+            content_type: Type of content
+            
+        Returns:
+            str: Generated summary
+        """
+        # In production, this would call the LLM to generate a summary
+        # For now, create a simple summary based on first sentences
+        
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        if not sentences:
+            return "No content to summarize."
+            
+        # Use first 1-3 sentences based on length
+        if len(sentences) >= 3 and len(" ".join(sentences[:3])) < 200:
+            summary = " ".join(sentences[:3])
+        elif len(sentences) >= 2:
+            summary = " ".join(sentences[:2])
+        else:
+            summary = sentences[0]
+            
+        # Truncate if still too long
+        if len(summary) > 200:
+            summary = summary[:197] + "..."
+            
+        return summary
+    
+    def _extract_key_phrases(self, text: str) -> List[str]:
+        """
+        Extract key phrases from text.
+        
+        Args:
+            text: Text to extract phrases from
+            
+        Returns:
+            List[str]: Extracted key phrases
+        """
+        # In production, this would use the LLM or other NLP techniques
+        # For now, use a simple approach based on capitalized phrases
+        
+        phrases = []
+        
+        # Look for capitalized phrases
+        cap_phrases = re.findall(r'([A-Z][a-z]+ (?:[A-Z][a-z]+ )?(?:[A-Z][a-z]+)?)', text)
+        
+        # Look for phrases surrounded by quotes
+        quoted_phrases = re.findall(r'"([^"]+)"', text)
+        
+        # Combine and deduplicate
+        candidate_phrases = cap_phrases + quoted_phrases
+        phrases = list(set([p for p in candidate_phrases if len(p) > 3]))[:5]  # Limit to 5 phrases
+        
+        return phrases
+    
+    def _generate_embeddings(self, processed_data: Dict) -> Dict:
+        """
+        Generate vector embeddings for text.
+        
+        Args:
+            processed_data: Processed content data
+            
+        Returns:
+            Dict: Data with added embeddings
+        """
+        # In production, this would call Vertex AI embeddings
+        # For now, return the data as-is with placeholder
+        processed_data["embeddings"] = {
+            "summary_embedding": "placeholder_for_vector",
+            "chunk_embeddings": ["placeholder_for_chunk_vectors"]
+        }
+        
+        return processed_data
+    
+    def _generate_graph_structure(self, processed_data: Dict, content_type: ContentType) -> Dict:
+        """
+        Generate graph structure for the Graph DB.
+        
+        Args:
+            processed_data: Processed content data
+            content_type: Type of content
+            
+        Returns:
+            Dict: Graph structure data
+        """
+        # Create nodes and relationships for the graph
+        nodes = []
+        relationships = []
+        
+        # Main content node
+        content_node = {
+            "id": str(uuid.uuid4()),
+            "labels": ["Content", content_type.value.capitalize()],
+            "properties": {
+                "summary": processed_data["summary"],
+                "timestamp": datetime.now().isoformat(),
+                "emotions": [e["emotion"] for e in processed_data.get("emotions", [{"emotion": "neutral"}])],
+                "vector_id": processed_data["embeddings"]["summary_embedding"]
+            }
+        }
+        nodes.append(content_node)
+        
+        # Entity nodes
+        for entity in processed_data.get("entities", []):
+            entity_node = {
+                "id": entity["entity_id"],
+                "labels": ["Entity", entity["type"].capitalize()],
+                "properties": {
+                    "name": entity["name"],
+                    "mentions": entity["mentions"],
+                    "confidence": entity["confidence"]
+                }
+            }
+            nodes.append(entity_node)
+            
+            # Relationship to content
+            relationships.append({
+                "id": str(uuid.uuid4()),
+                "type": "MENTIONED_IN",
+                "start_node": entity["entity_id"],
+                "end_node": content_node["id"],
+                "properties": {
+                    "confidence": entity["confidence"]
+                }
+            })
+        
+        # Add relationships between entities
+        for rel in processed_data.get("relationships", []):
+            relationships.append({
+                "id": rel["relationship_id"],
+                "type": rel["type"].upper(),
+                "start_node": rel["source_id"],
+                "end_node": rel["target_id"],
+                "properties": {
+                    "confidence": rel["confidence"],
+                    "extracted_text": rel["extracted_text"]
+                }
+            })
+            
+        # Special processing based on content type
+        if content_type == ContentType.DECISION:
+            # Add decision outcome as a separate node if present
+            outcome = processed_data.get("outcome")
+            if outcome and outcome != "pending":
+                outcome_node = {
+                    "id": str(uuid.uuid4()),
+                    "labels": ["Outcome"],
+                    "properties": {
+                        "result": outcome,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                }
+                nodes.append(outcome_node)
+                
+                relationships.append({
+                    "id": str(uuid.uuid4()),
+                    "type": "RESULTED_IN",
+                    "start_node": content_node["id"],
+                    "end_node": outcome_node["id"],
+                    "properties": {}
+                })
+        
+        return {
+            "nodes": nodes,
+            "relationships": relationships
+        }
+    
+    def _determine_source(self, content: Dict, content_type: ContentType) -> str:
+        """
+        Determine the source of the content.
+        
+        Args:
+            content: Raw content
+            content_type: Type of content
+            
+        Returns:
+            str: Source information
+        """
+        if content_type == ContentType.SEARCH_RESULT:
+            return content.get("query", "unknown search")
+        elif content_type == ContentType.TWEET:
+            return f"Twitter - {content.get('operation', 'unknown operation')}"
+        elif content_type == ContentType.LLM_THOUGHT:
+            return "Internal Reasoning"
+        elif content_type == ContentType.IMAGINATION:
+            return f"Imagination Engine - {content.get('imagination_type', 'general')}"
+        elif content_type == ContentType.INTERACTION:
+            return f"Interaction with {content.get('participant', 'unknown')}"
+        elif content_type == ContentType.DECISION:
+            return "Decision Process"
+        else:
+            return "Unknown Source"
+    
+    def _extract_timestamp(self, content: Dict, content_type: ContentType) -> str:
+        """
+        Extract the creation timestamp of the content.
+        
+        Args:
+            content: Raw content
+            content_type: Type of content
+            
+        Returns:
+            str: Timestamp in ISO format
+        """
+        # Try to get original timestamp based on content type
+        if content_type == ContentType.TWEET and content.get("tweets"):
+            tweet = content["tweets"][0]
+            return tweet.get("created_at", datetime.now().isoformat())
+        elif "timestamp" in content:
+            return content["timestamp"]
+        else:
+            return datetime.now().isoformat()
+    
+    def _aggregate_emotions(self, chunks: List[Dict]) -> Dict:
+        """
+        Aggregate emotions across all chunks.
+        
+        Args:
+            chunks: Content chunks with emotions
+            
+        Returns:
+            Dict: Aggregated emotion data
+        """
+        emotion_counts = {}
+        total_chunks = len(chunks)
+        
+        # Count emotion occurrences
+        for chunk in chunks:
+            chunk_emotions = chunk.get("emotions", [])
+            for emotion_data in chunk_emotions:
+                emotion = emotion_data["emotion"]
+                score = emotion_data["score"]
+                
+                if emotion not in emotion_counts:
+                    emotion_counts[emotion] = {
+                        "count": 0,
+                        "score_sum": 0
+                    }
+                    
+                emotion_counts[emotion]["count"] += 1
+                emotion_counts[emotion]["score_sum"] += score
+        
+        # Calculate averages and dominant emotions
+        aggregated = {}
+        for emotion, data in emotion_counts.items():
+            aggregated[emotion] = {
+                "frequency": data["count"] / total_chunks,
+                "average_score": data["score_sum"] / data["count"],
+                "count": data["count"]
+            }
+            
+        # Find dominant emotions (top 3 by frequency * score)
+        emotion_scores = [(emotion, data["frequency"] * data["average_score"]) 
+                         for emotion, data in aggregated.items()]
+        dominant = sorted(emotion_scores, key=lambda x: x[1], reverse=True)[:3]
+        
+        return {
+            "emotions": aggregated,
+            "dominant_emotions": [e[0] for e in dominant],
+            "chunk_count": total_chunks
+        }
