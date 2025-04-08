@@ -1,7 +1,6 @@
 Aetherius Project - White Paper - Version 1.2
-Date: October 26, 2023 (Reflecting context)
 Document Status: Comprehensive Design Draft
-Contact: [Your Name/Project Lead]
+Contact: Braden-sui
 Table of Contents
 1.	Executive Summary
 2.	Introduction
